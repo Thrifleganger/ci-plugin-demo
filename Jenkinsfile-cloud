@@ -1,0 +1,250 @@
+/*
+	This is a declarative pipeline script for Jenkins for Projucer type JUCE plugin projects
+	Fill the variables at the start of this file to configure the build pipeline for your plugin.
+	The build pipeline performs the following stages: 
+	1) Checkout: The build pipeline is triggered for every change to the master branch. The Checkout stage sends a Slack notification that a build has been started, cleans the old workspace and clones the project locally within the Jenkins executor.
+	2) Build: Depending on the OS, the corresponding build system is utilized to build VST3 and AU targets.
+	3) Test: The plugin is subjected to a testing application called pluginval. 
+	4) Package: The build artifacts are packaged into an installer (.exe or .pkg), code signed and notarized.
+	5) Deploy: The installer file is pushed to an S3 bucket
+	6) Post: A Slack notification is sent out regarding the status of the build
+*/
+
+/* 
+	The project name is the name of projucer file / plugin name configured within the projucer file. Avoid spaces.
+*/
+def projectName = 'ci-plugin-demo'
+/*
+	The clone URL of the git repo. Add the SSH variant which starts with "git@github.com"
+*/
+def gitRepoUrl = 'git@github.com:Thrifleganger/ci-plugin-demo.git'
+/*
+	Name of the slack channel to upload the artifact and report to.
+*/
+def slackChannel = 'jenkins-integration'
+
+def version = ''
+def installerFile = ''
+
+/*
+	Start of pipeline script. 
+*/
+pipeline {
+    agent none
+	triggers {
+		pollSCM('*/2 * * * *')
+	}	
+    stages {
+		stage("Checkout") {
+			matrix {
+				axes {
+                    axis {
+                        name 'platform'
+                        values 'windows', 'mac'
+                    }
+                }
+                stages {
+                	stage("Checkout (platform specific)") {
+						agent { 
+							label "${platform}"
+						}
+						steps {	
+							slackSend channel: "${slackChannel}", 
+								tokenCredentialId: 'slack-integration',
+								color: "good",
+								message: "Build started: ${env.JOB_NAME} ${env.BUILD_NUMBER} : ${env.BUILD_URL}"
+							cleanWs()
+							checkout([
+								$class: 'GitSCM', 
+								branches: [[name: '*/master']], 
+								extensions: [], 
+								userRemoteConfigs: [[
+									credentialsId: 'AwsJenkinsMasterToGithub', 
+									url: "${gitRepoUrl}"
+								]]
+							])
+						}
+					}
+                }							
+			}
+		}
+		stage('Build') {
+			parallel {			
+				stage('Build (Windows)') { 
+					agent { 
+						label 'windows'
+					}
+					steps {
+						echo "Building plugin for Windows"
+						bat """
+							curl -L "https://api.juce.com/api/v1/download/juce/latest/windows" -o juce.zip
+							jar xf juce.zip
+							"JUCE/projucer.exe" --set-global-search-path windows defaultJuceModulePath JUCE/modules
+							"JUCE/projucer.exe" --resave "${projectName}.jucer"													
+							cd Builds/VisualStudio2019							
+							if not defined MSBUILD_EXE set MSBUILD_EXE=C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/MSBuild/Current/Bin/MSBuild.exe
+							"%MSBUILD_EXE%" ${projectName}.sln /p:VisualStudioVersion=16.0 /m /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64			
+							copy "x64\\Release\\VST3\\${projectName}.vst3" "..\\..\\Installer\\Windows\\${projectName}.vst3"							
+						"""
+						script {
+							def versionScript = """
+								@(
+									"JUCE/projucer.exe" --get-version ${projectName}.jucer
+								)
+							"""
+							version = bat(script: versionScript, returnStdout: true).trim()
+						}
+						
+					}
+				}
+				stage('Build (Mac)') { 
+					agent { 
+						label 'mac'
+					}
+					steps {
+						echo "Building plugin for Linux/Mac"
+						sh """
+							curl -L https://api.juce.com/api/v1/download/juce/latest/osx -o juce.zip
+							unzip juce
+							./JUCE/Projucer.app/Contents/MacOS/Projucer --resave ${projectName}.jucer							
+							cd Builds/MacOSX
+							xcodebuild -configuration Release -scheme "${projectName} - All" build
+							cp -R `readlink build/Release/${projectName}.vst3` ../../Installer/Mac/${projectName}.vst3
+							cp -R `readlink build/Release/${projectName}.component` ../../Installer/Mac/${projectName}.component
+						"""
+						script {
+							version = sh(
+								script: "./JUCE/Projucer.app/Contents/MacOS/Projucer --get-version ${projectName}.jucer", 
+								returnStdout: true
+							).trim()
+						}				
+					}
+				}
+			}
+		}
+		stage('Test') {
+			parallel {			
+				stage('Test (Windows)') { 
+					agent { 
+						label 'windows'
+					}
+					steps {
+						echo "Validating plugin"
+						bat """
+							curl -L "https://github.com/Tracktion/pluginval/releases/download/latest_release/pluginval_Windows.zip" -o pluginval.zip
+							jar xf pluginval.zip
+							pluginval.exe --validate-in-process --validate "Installer/Windows/${projectName}.vst3"
+						"""
+					}
+				}
+				stage('Test (Mac)') { 
+					agent { 
+						label 'mac'
+					}
+					steps {
+						echo "Validating plugin"
+						sh """
+							curl -L "https://github.com/Tracktion/pluginval/releases/download/latest_release/pluginval_macOS.zip" -o pluginval.zip
+							unzip pluginval
+							pluginval.app/Contents/MacOS/pluginval --validate-in-process --validate "Installer/Mac/${projectName}.vst3" || exit 1
+						"""
+					}
+				}
+			}
+		}
+		stage('Package') {
+			parallel {	
+				stage('Package (Windows)') {
+					agent { 
+						label 'windows'
+					}
+					steps {				
+						echo "Packaging plugin for Windows"
+						bat """
+							curl -L https://jrsoftware.org/download.php/is.exe -o innosetup.exe
+							innosetup.exe /portable=1 /silent /currentuser /dir="./innosetup"
+							"innosetup/iscc" /DVersion=${version} "Installer/Windows/${projectName}-installer.iss"
+							signtool sign "Installer/Windows/Output/${projectName}-${version}.exe"
+						"""	
+						script {				
+							writeFile(file: "installerFile", text: "Installer/Windows/Output/${projectName}-${version}.exe")	
+						}
+					}
+				}
+				stage('Package (Mac)') {
+					agent { 
+						label 'mac'
+					}
+					steps {						
+						echo "Packaging plugin for Linux/Mac"	
+						withCredentials([usernamePassword(credentialsId: 'mac-code-signing', passwordVariable: 'password', usernameVariable: 'username')]) {
+							sh """
+								cd Installer/Mac
+								sh ./install.sh -u ${username} -p ${password} -v ${version}
+							"""
+						}	
+						script {	
+							writeFile(file: "installerFile", text: "Installer/Mac/build/${projectName}-${version}.pkg")										
+						}
+					}
+				}
+			}
+		}
+		stage('Deploy') {
+			matrix {
+				axes {
+                    axis {
+                        name 'platform'
+                        values 'windows', 'mac'
+                    }
+                }
+                stages {
+                	stage("Deploy (platform specific)") {							
+						agent { 
+							label "${platform}"
+						}
+						steps {
+							script {
+								installerFile = readFile(file: 'installerFile').trim()
+							}
+							s3Upload consoleLogLevel: 'INFO', 
+								dontSetBuildResultOnFailure: false, 
+								dontWaitForConcurrentBuildCompletion: false, 
+								entries: [[
+									bucket: "${projectName}/${version}", 
+									excludedFile: '', 
+									flatten: false, 
+									gzipFiles: false, 
+									keepForever: false, 
+									managedArtifacts: false, 
+									noUploadOnFailure: true, 
+									selectedRegion: 'eu-west-2', 
+									showDirectlyInBrowser: false, 
+									sourceFile: "${installerFile}", 
+									storageClass: 'STANDARD', 
+									uploadFromSlave: false, 
+									useServerSideEncryption: false]], 
+								pluginFailureResultConstraint: 'FAILURE', 
+								profileName: 'S3PublisherProfile', 
+								userMetadata: []	
+						}	
+					}
+				}
+			}				
+		}
+    }
+	post {
+		success {
+			slackSend channel: "${slackChannel}", 
+				tokenCredentialId: 'slack-integration',
+				color: "good",
+				message: "Build Succeeded: ${env.JOB_NAME} ${env.BUILD_NUMBER} : ${env.BUILD_URL}"
+		}
+		failure {
+			slackSend channel: "${slackChannel}", 
+				tokenCredentialId: 'slack-integration',
+				color: "danger",
+				message: "Build Failed: ${env.JOB_NAME} ${env.BUILD_NUMBER} : ${env.BUILD_URL}"
+		}       
+    }
+}   

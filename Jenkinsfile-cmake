@@ -1,0 +1,126 @@
+/*
+	This is a declarative pipeline script for Jenkins for cmake type JUCE plugin projects
+	Fill the variables at the start of this file to configure the build pipeline for your plugin.
+	The build pipeline performs the following stages: 
+	1) Checkout: The build pipeline is triggered for every change to the master branch. The Checkout stage clones the project locally within the Jenkins executor.
+	2) Build: Depending on the OS, the corresponding build system is utilized to build VST3 and AU targets.
+	3) Test: The plugin is subjected to a testing application called pluginval. 
+	4) Package: The build artifacts are packaged into an installer (.exe or .pkg).
+*/
+
+/* 
+	The project name is the ProjectName configured within the CMakeLists.txt file. Avoid spaces.
+*/
+def projectName = 'ci-plugin-demo'
+
+/*
+	The clone URL of the git repo. Add the SSH variant which starts with "git@github.com"
+*/
+def gitRepoUrl = 'git@github.com:Thrifleganger/ci-plugin-demo.git'
+
+def version = ''
+
+/*
+	Start of pipeline script. 
+*/
+pipeline {
+    agent any
+	triggers {
+		pollSCM('*/2 * * * *')
+	}	
+    stages {
+		stage('Checkout') {
+			steps {	
+				cleanWs()
+				checkout([
+					$class: 'GitSCM', 
+					branches: [[name: '*/master']], 
+					extensions: [[
+						$class: 'SubmoduleOption', 
+						recursiveSubmodules: true]], 
+					userRemoteConfigs: [[
+						credentialsId: 'jenkins-to-github', 
+						url: "${gitRepoUrl}"
+					]]
+				])
+			}
+		}
+        stage('Build') { 
+            steps {
+				script {				
+					if (!isUnix()) {
+						echo "Building plugin for Windows"
+						bat """
+							mkdir Builds
+							cd Builds
+							cmake .. -G "Visual Studio 16 2019" -DJUCE_COPY_PLUGIN_AFTER_BUILD=OFF
+							cmake --build . --target "${projectName}_VST3" --config Release
+							copy "${projectName}_artefacts\\Release\\VST3\\${projectName}.vst3\\Contents\\x86_64-win\\${projectName}.vst3" "..\\Installer\\Windows\\${projectName}.vst3"				
+						"""
+						def versionScript = """
+							@(
+								more version
+							)
+						"""
+						version = bat(script: versionScript, returnStdout: true).trim()
+					} else {
+						echo "Building plugin for Linux/Mac"
+						sh """
+							mkdir Builds
+							cd Builds
+							cmake .. -G Xcode -DJUCE_COPY_PLUGIN_AFTER_BUILD=OFF
+							cmake --build . --target "${projectName}_VST3" --config Release
+							cmake --build . --target "${projectName}_AU" --config Release
+							cp -R "${projectName}_artefacts/Release/VST3/${projectName}.vst3" "../Installer/Mac/${projectName}.vst3"
+							cp -R "${projectName}_artefacts/Release/AU/${projectName}.component" "../Installer/Mac/${projectName}.component"
+						"""
+						version = sh(
+							script: "cat version", 
+							returnStdout: true
+						).trim()						
+					}
+				}
+            }
+        }
+        stage('Test') { 
+            steps {
+				script {
+					echo "Validating plugin"
+					if (!isUnix()) {
+						bat """
+							curl -L "https://github.com/Tracktion/pluginval/releases/download/latest_release/pluginval_Windows.zip" -o pluginval.zip
+							jar xf pluginval.zip
+							pluginval.exe --validate-in-process --validate "Installer/Windows/${projectName}.vst3"
+						"""
+					} else {
+						sh """
+							curl -L "https://github.com/Tracktion/pluginval/releases/download/latest_release/pluginval_macOS.zip" -o pluginval.zip
+							unzip pluginval
+							pluginval.app/Contents/MacOS/pluginval --validate-in-process --validate "Installer/Mac/${projectName}.vst3" || exit 1
+						"""
+					}
+				}
+            }
+        }
+		stage('Package') {
+			steps {
+				script {				
+					if (!isUnix()) {
+						echo "Packaging plugin for Windows"
+						bat """
+							curl -L https://jrsoftware.org/download.php/is.exe -o innosetup.exe
+							innosetup.exe /portable=1 /silent /currentuser /dir="./innosetup"
+						    "innosetup/iscc" /DVersion=${version} "Installer/Windows/${projectName}-installer.iss"
+						"""
+					} else {
+						echo "Packaging plugin for Linux/Mac"						
+						sh """
+							cd Installer/Mac
+							packagesbuild -v ${projectName}.pkgproj
+						"""
+					}
+				}
+			}
+		}		
+    }
+}   
