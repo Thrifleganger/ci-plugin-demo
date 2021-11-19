@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.15)
 set(CMAKE_CXX_STANDARD 17)
 
 set (ProjectName ci-plugin-demo)
-set (ProjectVersion 1.0.0)
+set (ProjectVersion 1.0.1)
 
 project(${ProjectName} VERSION ${ProjectVersion})
 

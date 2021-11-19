@@ -3,7 +3,8 @@
 <JUCERPROJECT id="pC7Uov" name="ci-plugin-demo" projectType="audioplug" useAppConfig="0"
               addUsingNamespaceToJuceHeader="1" displaySplashScreen="1" jucerFormatVersion="1"
               pluginFormats="buildAU,buildVST3" pluginManufacturer="ADC" companyName="ADC"
-              bundleIdentifier="com.ADC.CiPluginDemo" cppLanguageStandard="14">
+              bundleIdentifier="com.ADC.CiPluginDemo" cppLanguageStandard="14"
+              version="1.0.1">
   <MAINGROUP id="XUzWpZ" name="ci-plugin-demo">
     <GROUP id="{67A3587F-A3C1-2B2F-B1B4-9D9C103E0F80}" name="Source">
       <FILE id="Qa0eWH" name="PluginProcessor.cpp" compile="1" resource="0"
